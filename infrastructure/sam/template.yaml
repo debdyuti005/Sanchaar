@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Sanchaar - Agentic Content Supply Chain for Bharat
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+  
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region where Bedrock is available
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 300
+    MemorySize: 1024
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        BEDROCK_REGION: !Ref BedrockRegion
+        CONTENT_TABLE: !Ref ContentTable
+        INGESTION_BUCKET: !Ref IngestionBucket
+        OUTPUT_BUCKET: !Ref OutputBucket
+
+Resources:
+  # S3 Buckets
+  IngestionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sanchaar-ingestion-${Environment}-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: MoveToGlacierAfter90Days
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sanchaar-output-${Environment}-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - '*'
+            AllowedMethods:
+              - GET
+            AllowedHeaders:
+              - '*'
+
+  # DynamoDB Table
+  ContentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub SanchaarContent-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: content_id
+          AttributeType: S
+        - AttributeName: version
+          AttributeType: N
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: content_id
+          KeyType: HASH
+        - AttributeName: version
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: user_id-created_at-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-created_at-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # Lambda Functions
+  VoiceProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub Sanchaar-VoiceProcessor-${Environment}
+      CodeUri: functions/voice_processor/
+      Handler: app.lambda_handler
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref IngestionBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ContentTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - transcribe:StartTranscriptionJob
+                - transcribe:GetTranscriptionJob
+              Resource: '*'
+      Events:
+        S3Event:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref IngestionBucket
+                object:
+                  key:
+                    - prefix: voice-commands/
+
+  MediaConvertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub Sanchaar-MediaConvert-${Environment}
+      CodeUri: functions/media_convert/
+      Handler: app.lambda_handler
+      Timeout: 900
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref IngestionBucket
+        - S3CrudPolicy:
+            BucketName: !Ref OutputBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - mediaconvert:CreateJob
+                - mediaconvert:GetJob
+                - mediaconvert:DescribeEndpoints
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - rekognition:DetectText
+                - rekognition:DetectFaces
+                - rekognition:DetectModerationLabels
+              Resource: '*'
+
+  PlatformDistributorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub Sanchaar-PlatformDistributor-${Environment}
+      CodeUri: functions/platform_distributor/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          WHATSAPP_API_KEY: '{{resolve:secretsmanager:sanchaar/whatsapp:SecretString:api_key}}'
+          SHARECHAT_API_KEY: '{{resolve:secretsmanager:sanchaar/sharechat:SecretString:api_key}}'
+          INSTAGRAM_ACCESS_TOKEN: '{{resolve:secretsmanager:sanchaar/instagram:SecretString:access_token}}'
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref OutputBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ContentTable
+
+  # Step Functions State Machine
+  ContentPipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub SanchaarContentPipeline-${Environment}
+      DefinitionUri: statemachine/content_pipeline.asl.json
+      DefinitionSubstitutions:
+        VoiceProcessorFunctionArn: !GetAtt VoiceProcessorFunction.Arn
+        MediaConvertFunctionArn: !GetAtt MediaConvertFunction.Arn
+        PlatformDistributorFunctionArn: !GetAtt PlatformDistributorFunction.Arn
+        BedrockAgentId: !Ref SupervisorBedrockAgent
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref VoiceProcessorFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref MediaConvertFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PlatformDistributorFunction
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeAgent
+                - bedrock:InvokeModel
+              Resource: '*'
+
+  # Bedrock Agents (Placeholder - requires manual setup)
+  SupervisorBedrockAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Sub sanchaar-supervisor-${Environment}
+      FoundationModel: anthropic.claude-3-5-sonnet-20241022-v2:0
+      Instruction: |
+        You are the Sanchaar Supervisor Agent. Coordinate content transcreation pipeline:
+        1. Parse voice commands and extract intent
+        2. Assign tasks to specialized agents (Transcreation, Media Factory, Platform Strategy)
+        3. Validate quality of outputs
+        4. Handle errors and optimize costs
+        Follow specifications in .kiro/specs/supervisor-workflow.md
+
+  # CloudFront Distribution
+  ContentDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt OutputBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${CloudFrontOAI}
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Headers:
+              - Accept-Language
+            Cookies:
+              Forward: none
+        PriceClass: PriceClass_200
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub OAI for Sanchaar ${Environment}
+
+  # IAM Roles
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub SanchaarBedrockAgentRole-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub ${IngestionBucket.Arn}/*
+                  - !Sub ${OutputBucket.Arn}/*
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt ContentTable.Arn
+                  - !Sub ${ContentTable.Arn}/index/*
+
+Outputs:
+  IngestionBucketName:
+    Description: S3 bucket for content ingestion
+    Value: !Ref IngestionBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-IngestionBucket
+
+  OutputBucketName:
+    Description: S3 bucket for processed content
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-OutputBucket
+
+  ContentTableName:
+    Description: DynamoDB table for content metadata
+    Value: !Ref ContentTable
+    Export:
+      Name: !Sub ${AWS::StackName}-ContentTable
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref ContentPipelineStateMachine
+    Export:
+      Name: !Sub ${AWS::StackName}-StateMachine
+
+  CloudFrontURL:
+    Description: CloudFront distribution URL
+    Value: !GetAtt ContentDistribution.DomainName
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudFrontURL

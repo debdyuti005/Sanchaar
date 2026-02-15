@@ -1,0 +1,178 @@
+{
+  "Comment": "Sanchaar Content Pipeline - Multi-Agent Orchestration",
+  "StartAt": "ParseInput",
+  "States": {
+    "ParseInput": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${VoiceProcessorFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultPath": "$.parsed_input",
+      "Next": "InvokeSupervisorAgent",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleError",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "InvokeSupervisorAgent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::bedrock:invokeAgent",
+      "Parameters": {
+        "AgentId": "${BedrockAgentId}",
+        "AgentAliasId": "TSTALIASID",
+        "SessionId.$": "$.content_id",
+        "InputText.$": "$.parsed_input.Payload.transcript"
+      },
+      "ResultPath": "$.supervisor_response",
+      "Next": "TranscreationParallel"
+    },
+    "TranscreationParallel": {
+      "Type": "Map",
+      "ItemsPath": "$.supervisor_response.target_languages",
+      "MaxConcurrency": 10,
+      "Iterator": {
+        "StartAt": "InvokeTranscreationAgent",
+        "States": {
+          "InvokeTranscreationAgent": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::bedrock:invokeAgent",
+            "Parameters": {
+              "AgentId": "transcreation-agent-id",
+              "AgentAliasId": "TSTALIASID",
+              "SessionId.$": "$$.Execution.Id",
+              "InputText.$": "States.Format('Transcreate to {}: {}', $.language, $.source_text)"
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.transcreations",
+      "Next": "MediaProcessingParallel"
+    },
+    "MediaProcessingParallel": {
+      "Type": "Map",
+      "ItemsPath": "$.supervisor_response.aspect_ratios",
+      "MaxConcurrency": 3,
+      "Iterator": {
+        "StartAt": "InvokeMediaConvert",
+        "States": {
+          "InvokeMediaConvert": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${MediaConvertFunctionArn}",
+              "Payload": {
+                "media_uri.$": "$.media_uri",
+                "aspect_ratio.$": "$.aspect_ratio",
+                "subtitle_languages.$": "$.subtitle_languages"
+              }
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.media_outputs",
+      "Next": "QualityValidation"
+    },
+    "QualityValidation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::bedrock:invokeAgent",
+      "Parameters": {
+        "AgentId": "${BedrockAgentId}",
+        "AgentAliasId": "TSTALIASID",
+        "SessionId.$": "$.content_id",
+        "InputText": "Validate quality of transcreations and media outputs"
+      },
+      "ResultPath": "$.validation_result",
+      "Next": "CheckQuality"
+    },
+    "CheckQuality": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.validation_result.status",
+          "StringEquals": "approved",
+          "Next": "DistributionFanout"
+        },
+        {
+          "Variable": "$.validation_result.status",
+          "StringEquals": "retry",
+          "Next": "TranscreationParallel"
+        }
+      ],
+      "Default": "FlagForReview"
+    },
+    "DistributionFanout": {
+      "Type": "Map",
+      "ItemsPath": "$.supervisor_response.target_platforms",
+      "MaxConcurrency": 3,
+      "Iterator": {
+        "StartAt": "InvokePlatformDistributor",
+        "States": {
+          "InvokePlatformDistributor": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${PlatformDistributorFunctionArn}",
+              "Payload": {
+                "platform.$": "$.platform",
+                "content_variants.$": "$.content_variants",
+                "media_urls.$": "$.media_urls"
+              }
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.distribution_results",
+      "Next": "LogResults"
+    },
+    "LogResults": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "SanchaarContent",
+        "Item": {
+          "content_id": {
+            "S.$": "$.content_id"
+          },
+          "version": {
+            "N.$": "States.Format('{}', $.version)"
+          },
+          "status": {
+            "S": "completed"
+          },
+          "transcreations": {
+            "S.$": "States.JsonToString($.transcreations)"
+          },
+          "distribution_results": {
+            "S.$": "States.JsonToString($.distribution_results)"
+          },
+          "created_at": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "End": true
+    },
+    "FlagForReview": {
+      "Type": "Pass",
+      "Result": {
+        "status": "requires_human_review"
+      },
+      "End": true
+    },
+    "HandleError": {
+      "Type": "Pass",
+      "Result": {
+        "status": "failed"
+      },
+      "End": true
+    }
+  }
+}

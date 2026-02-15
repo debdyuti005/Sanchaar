@@ -1,0 +1,44 @@
+# Environment
+.env
+.env.local
+
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
+# AWS CDK
+cdk.out/
+*.js
+*.d.ts
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Data
+data/indic-corpus/*
+!data/indic-corpus/.gitkeep
+
+# Secrets
+secrets.json
+credentials.json

@@ -1,0 +1,14 @@
+# Place your Indic language corpus files here
+# 
+# Recommended structure:
+# - cultural-references/
+#   - festivals.json
+#   - traditions.json
+#   - regional-customs.json
+# - idioms-phrases/
+#   - hindi-idioms.json
+#   - tamil-idioms.json
+#   - telugu-idioms.json
+# - brand-guidelines/
+#   - tone-examples.json
+#   - terminology.json
