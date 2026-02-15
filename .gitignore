@@ -1,3 +1,11 @@
+# Next.js
+.next/
+out/
+build/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+
 # Environment
 .env
 .env.local
